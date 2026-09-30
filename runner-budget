@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# runner-budget: spend a GitHub org's included Actions minutes first, then overflow to
+# Blacksmith's free minutes, by flipping a CI_RUNNER repo variable that workflows read in
+# `runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}`.
+#
+#   runner-budget check   --org ORG
+#   runner-budget install --org ORG --repos REPO[,REPO...] [options]
+#   runner-budget select  (run by the installed hourly workflow; configured by env)
+#
+# Requires bash 3.2+, curl, jq, and (for check/install) an authenticated gh CLI.
+set -euo pipefail
+
+readonly VERSION="0.1.0"
+readonly API="${RUNNER_BUDGET_API:-https://api.github.com}"
+readonly DEFAULT_FLEET="ubuntu-latest"
+readonly DEFAULT_OVERFLOW="blacksmith-2vcpu-ubuntu-2404"
+readonly DEFAULT_OVERFLOW_SMALL="blacksmith-2vcpu-ubuntu-2404"
+# Headroom below the included minutes for jobs already queued when the fleet flips.
+readonly DEFAULT_MARGIN=200
+readonly WORKFLOW_PATH=".github/workflows/runner-budget.yml"
+readonly SCRIPT_PATH=".github/scripts/runner-budget"
+
+die() {
+  echo "runner-budget: $*" >&2
+  exit 1
+}
+
+# --- Pure decision logic (unit-tested in test/) ------------------------------------------
+
+# Included monthly minutes for an org plan name, or empty when unknown.
+# https://docs.github.com/en/billing/concepts/product-billing/github-actions
+included_minutes_for_plan() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    free) echo 2000 ;;
+    team) echo 3000 ;;
+    enterprise | enterprise_cloud) echo 50000 ;;
+    *) echo "" ;;
+  esac
+}
+
+# Actions minutes used, read from an enhanced billing usage JSON body on stdin.
+actions_minutes_from_usage() {
+  jq -er '[.usageItems[]?
+      | select((.product | ascii_downcase) == "actions"
+               and (.unitType | ascii_downcase) == "minutes")
+      | .quantity] | add // 0 | floor'
+}
+
+# Prints "<main-label> <small-label>" for the fleet that should run jobs now.
+fleet_for_usage() {
+  local used="$1" threshold="$2" overflow="$3" overflow_small="$4"
+  if [[ ! "$used" =~ ^[0-9]+$ || ! "$threshold" =~ ^[0-9]+$ ]]; then
+    die "usage and threshold must be whole numbers (got '$used', '$threshold')"
+  fi
+  if ((used < threshold)); then
+    echo "$DEFAULT_FLEET $DEFAULT_FLEET"
+  else
+    echo "$overflow $overflow_small"
+  fi
+}
+
+# Rewrites `runs-on: ubuntu-latest` lines (stdin -> stdout) to read the CI_RUNNER variable.
+rewrite_runs_on() {
+  sed -E "s/^([[:space:]]*runs-on:[[:space:]]*)ubuntu-latest[[:space:]]*$/\1\${{ vars.CI_RUNNER || '$DEFAULT_FLEET' }}/"
+}
+
+# --- GitHub API ---------------------------------------------------------------------------
+
+# GET/PATCH against the REST API with a token; prints the body, fails with status + body.
+api() {
+  local method="$1" path="$2" token="$3" data="${4:-}"
+  local body status
+  body=$(mktemp)
+  local args=(-s -o "$body" -w '%{http_code}' -X "$method"
+    -H "Authorization: Bearer $token"
+    -H "Accept: application/vnd.github+json"
+    -H "X-GitHub-Api-Version: 2022-11-28")
+  [[ -n "$data" ]] && args+=(-d "$data")
+  status=$(curl "${args[@]}" "$API$path") || {
+    rm -f "$body"
+    die "$method $path: no HTTP response (curl exit $?)"
+  }
+  if [[ "$status" != 2* ]]; then
+    local snippet
+    snippet=$(head -c 200 "$body" | tr -d '\n')
+    rm -f "$body"
+    die "$method $path: HTTP $status $snippet"
+  fi
+  cat "$body"
+  rm -f "$body"
+}
+
+# Minutes used this month. The enhanced billing endpoint is the only trustworthy source:
+# legacy endpoints report zeros on the enhanced platform, and a false zero would keep jobs
+# on an exhausted pool. Classic tokens only; fine-grained tokens are rejected.
+minutes_used() {
+  local org="$1" token="$2"
+  api GET "/organizations/$org/settings/billing/usage?year=$(date -u +%Y)&month=$(date -u +%-m)" "$token" |
+    actions_minutes_from_usage
+}
+
+set_variable() {
+  local repo="$1" name="$2" value="$3" token="$4"
+  api PATCH "/repos/$repo/actions/variables/$name" "$token" \
+    "$(jq -nc --arg n "$name" --arg v "$value" '{name: $n, value: $v}')" >/dev/null
+}
+
+# --- Commands -----------------------------------------------------------------------------
+
+cmd_check() {
+  local org="" threshold=""
+  while (($#)); do
+    case "$1" in
+      --org) org="$2"; shift 2 ;;
+      --threshold) threshold="$2"; shift 2 ;;
+      *) die "check: unknown option $1" ;;
+    esac
+  done
+  [[ -n "$org" ]] || die "check: --org is required"
+  local token plan included used main
+  token=$(gh auth token) || die "check: run 'gh auth login' first"
+  plan=$(api GET "/orgs/$org" "$token" | jq -r '.plan.name // ""')
+  included=$(included_minutes_for_plan "$plan")
+  if [[ -z "$threshold" ]]; then
+    [[ -n "$included" ]] || die "check: plan '$plan' unknown; pass --threshold"
+    threshold=$((included - DEFAULT_MARGIN))
+  fi
+  used=$(minutes_used "$org" "$token")
+  read -r main _ <<<"$(fleet_for_usage "$used" "$threshold" "$DEFAULT_OVERFLOW" "$DEFAULT_OVERFLOW_SMALL")"
+  echo "org:        $org (plan: ${plan:-unknown}, included: ${included:-unknown} min)"
+  echo "used:       $used min this month"
+  echo "switch at:  $threshold min"
+  echo "fleet now:  $main"
+}
+
+# Runs inside the installed workflow. Config comes from env so the workflow file stays data.
+cmd_select() {
+  local token="${RUNNER_BUDGET_PAT:-}" org="${RUNNER_BUDGET_ORG:?}" repos="${RUNNER_BUDGET_REPOS:?}"
+  local threshold="${RUNNER_BUDGET_THRESHOLD:?}"
+  local overflow="${RUNNER_BUDGET_OVERFLOW:-$DEFAULT_OVERFLOW}"
+  local overflow_small="${RUNNER_BUDGET_OVERFLOW_SMALL:-$DEFAULT_OVERFLOW_SMALL}"
+  if [[ -z "$token" ]]; then
+    echo "::notice::RUNNER_BUDGET_PAT is not set; leaving CI_RUNNER unchanged."
+    return 0
+  fi
+  local used main small
+  used=$(minutes_used "$org" "$token")
+  read -r main small <<<"$(fleet_for_usage "$used" "$threshold" "$overflow" "$overflow_small")"
+  echo "Minutes used: $used (switch at $threshold) -> $main / small $small"
+  local repo
+  for repo in ${repos//,/ }; do
+    set_variable "$repo" CI_RUNNER "$main" "$token"
+    set_variable "$repo" CI_RUNNER_SMALL "$small" "$token"
+    echo "$repo: CI_RUNNER=$main CI_RUNNER_SMALL=$small"
+  done
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    printf '### Runner budget\n- Minutes used: **%s** (switch at %s)\n- Fleet: **%s**\n' \
+      "$used" "$threshold" "$main" >>"$GITHUB_STEP_SUMMARY"
+  fi
+}
+
+workflow_yaml() {
+  local org="$1" repos="$2" threshold="$3" overflow="$4" overflow_small="$5"
+  cat <<EOF
+name: Runner budget
+
+# Installed by runner-budget $VERSION (https://github.com/aperswal/runner-budget).
+# Hourly: while $org has used fewer than $threshold hosted minutes this month, jobs run on
+# GitHub's included runners; past that they run on $overflow. The 1st-of-month tick
+# flips back. This job itself runs on the overflow fleet so it still runs when the
+# included pool is exhausted. Needs the RUNNER_BUDGET_PAT secret: a CLASSIC PAT of an org
+# owner with the repo scope (the billing endpoint rejects fine-grained tokens).
+
+on:
+  schedule:
+    - cron: "20 * * * *"
+    - cron: "8 0 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  select:
+    runs-on: $overflow_small
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+      - name: Pick fleet from billing usage
+        env:
+          RUNNER_BUDGET_PAT: \${{ secrets.RUNNER_BUDGET_PAT }}
+          RUNNER_BUDGET_ORG: $org
+          RUNNER_BUDGET_REPOS: $repos
+          RUNNER_BUDGET_THRESHOLD: \${{ vars.RUNNER_BUDGET_THRESHOLD || '$threshold' }}
+          RUNNER_BUDGET_OVERFLOW: $overflow
+          RUNNER_BUDGET_OVERFLOW_SMALL: $overflow_small
+        run: bash $SCRIPT_PATH select
+EOF
+}
+
+# Opens a PR in one repo: adds the selector files (selector repo only) and rewrites
+# runs-on: ubuntu-latest in its workflows. Prints the PR URL, or a skip note.
+open_setup_pr() {
+  local repo="$1" add_selector="$2" workflow="$3" dry_run="$4"
+  local dir branch="runner-budget-setup" changed=0
+  dir=$(mktemp -d)
+  gh repo clone "$repo" "$dir" -- --quiet --depth 1 >/dev/null 2>&1 || die "install: cannot clone $repo"
+  if [[ "$add_selector" == 1 ]]; then
+    mkdir -p "$dir/$(dirname "$WORKFLOW_PATH")" "$dir/$(dirname "$SCRIPT_PATH")"
+    printf '%s\n' "$workflow" >"$dir/$WORKFLOW_PATH"
+    cp "${BASH_SOURCE[0]}" "$dir/$SCRIPT_PATH"
+    changed=1
+  fi
+  local file
+  for file in "$dir"/.github/workflows/*.yml "$dir"/.github/workflows/*.yaml; do
+    [[ -f "$file" && "$file" != "$dir/$WORKFLOW_PATH" ]] || continue
+    rewrite_runs_on <"$file" >"$file.new"
+    if cmp -s "$file" "$file.new"; then rm "$file.new"; else mv "$file.new" "$file"; changed=1; fi
+  done
+  if [[ "$changed" == 0 ]]; then
+    echo "$repo: no ubuntu-latest jobs to switch; skipped"
+    rm -rf "$dir"
+    return 0
+  fi
+  if [[ "$dry_run" == 1 ]]; then
+    echo "$repo: would open a PR with:"
+    git -C "$dir" add -A && git -C "$dir" diff --cached --stat
+    rm -rf "$dir"
+    return 0
+  fi
+  git -C "$dir" checkout -q -b "$branch"
+  git -C "$dir" add -A
+  git -C "$dir" commit -q -m "Route CI through runner-budget"
+  git -C "$dir" push -q -u origin "$branch" || die "install: push to $repo failed"
+  (cd "$dir" && gh pr create --repo "$repo" --head "$branch" --title "Route CI through runner-budget" \
+    --body "Workflows now read \`runs-on\` from the \`CI_RUNNER\` variable, which runner-budget flips from GitHub's included minutes to the overflow fleet once they run low. See https://github.com/aperswal/runner-budget.")
+  rm -rf "$dir"
+}
+
+cmd_install() {
+  local org="" repos="" selector="" threshold="" dry_run=0
+  local overflow="$DEFAULT_OVERFLOW" overflow_small="$DEFAULT_OVERFLOW_SMALL"
+  while (($#)); do
+    case "$1" in
+      --org) org="$2"; shift 2 ;;
+      --repos) repos="$2"; shift 2 ;;
+      --selector-repo) selector="$2"; shift 2 ;;
+      --threshold) threshold="$2"; shift 2 ;;
+      --overflow) overflow="$2"; shift 2 ;;
+      --overflow-small) overflow_small="$2"; shift 2 ;;
+      --dry-run) dry_run=1; shift ;;
+      *) die "install: unknown option $1" ;;
+    esac
+  done
+  [[ -n "$org" && -n "$repos" ]] || die "install: --org and --repos are required"
+  local token plan included used main small repo full_repos=""
+  token=$(gh auth token) || die "install: run 'gh auth login' first"
+  for repo in ${repos//,/ }; do
+    [[ "$repo" == */* ]] || repo="$org/$repo"
+    full_repos="${full_repos:+$full_repos,}$repo"
+  done
+  selector="${selector:-${full_repos%%,*}}"
+  [[ "$selector" == */* ]] || selector="$org/$selector"
+  plan=$(api GET "/orgs/$org" "$token" | jq -r '.plan.name // ""')
+  included=$(included_minutes_for_plan "$plan")
+  if [[ -z "$threshold" ]]; then
+    [[ -n "$included" ]] || die "install: plan '$plan' unknown; pass --threshold"
+    threshold=$((included - DEFAULT_MARGIN))
+  fi
+  used=$(minutes_used "$org" "$token")
+  read -r main small <<<"$(fleet_for_usage "$used" "$threshold" "$overflow" "$overflow_small")"
+  echo "$org: $used of ${included:-?} included minutes used; switch at $threshold; starting fleet $main"
+  echo "Overflow runs on $overflow. Install the Blacksmith GitHub App on $org first: https://app.blacksmith.sh"
+
+  for repo in ${full_repos//,/ }; do
+    if [[ "$dry_run" == 1 ]]; then
+      echo "$repo: would set CI_RUNNER=$main CI_RUNNER_SMALL=$small"
+    else
+      gh variable set CI_RUNNER --repo "$repo" --body "$main"
+      gh variable set CI_RUNNER_SMALL --repo "$repo" --body "$small"
+    fi
+  done
+  if [[ "$dry_run" == 0 ]]; then
+    echo "Paste a CLASSIC personal access token (repo scope, org owner) for $selector."
+    echo "Create one at https://github.com/settings/tokens/new?scopes=repo&description=runner-budget"
+    gh secret set RUNNER_BUDGET_PAT --repo "$selector"
+  fi
+  local workflow
+  workflow=$(workflow_yaml "$org" "$full_repos" "$threshold" "$overflow" "$overflow_small")
+  for repo in ${full_repos//,/ }; do
+    open_setup_pr "$repo" "$([[ "$repo" == "$selector" ]] && echo 1 || echo 0)" "$workflow" "$dry_run"
+  done
+}
+
+usage() {
+  sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+main() {
+  local cmd="${1:-}"
+  (($#)) && shift
+  case "$cmd" in
+    check) cmd_check "$@" ;;
+    install) cmd_install "$@" ;;
+    select) cmd_select ;;
+    version | --version) echo "runner-budget $VERSION" ;;
+    "" | help | -h | --help) usage ;;
+    *) die "unknown command '$cmd' (try: runner-budget help)" ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
